@@ -53,7 +53,11 @@ class CloudClient(object):
 
         self.ignore_ssl = \
             self.config.get("global", "ignore_ssl").lower() == "on"
+        self.ca_certs = \
+            self.config.get("global", "ca_certs")
         https.patch_ignore_ssl(self.ignore_ssl)
+        if self.ca_certs is not None:
+            https.patch_with_certs(self.ca_certs)
         self.auth_url = self.config.get_cloud(self.cloud, "url")
         self.token = self.config.get_cloud(self.cloud, "token")
         self.auth_client = AstakosClient(self.auth_url, self.token)
