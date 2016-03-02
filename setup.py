@@ -7,7 +7,7 @@ def read(fname):
 
 setup(
     name="snfinv",
-    version="0.1.1",
+    version="0.1.2",
     py_modules=['snfinv'],
     install_requires=['kamaki', 'pyfscache', 'pyyaml'],
     author="Kostas Papadimitriou",
