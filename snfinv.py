@@ -12,6 +12,8 @@ import argparse
 import re
 import time
 
+from jinja2 import Environment
+
 UUID_RE = re.compile('[0-9a-f\-]{36}\Z', re.I)
 
 fscache = pyfscache.FSCache("/tmp/.inv-cache", seconds=120)
@@ -30,6 +32,16 @@ from kamaki.clients.astakos import AstakosClient, parse_endpoints
 from kamaki.cli import _setup_logging
 
 from astakosclient.errors import NoEndpoints
+
+
+def flatten(z):
+    result = []
+    for item in z:
+        if isinstance(item, list):
+            result.extend(item)
+        else:
+            result.append(item)
+    return result
 
 
 class CloudClient(object):
@@ -86,7 +98,7 @@ class CloudClient(object):
             name, {}).get('endpoint', ns)
         try:
             catalog = parse_endpoints(self.endpoints, ep_type=endpoint_type)
-        except NoEndpoints, e:
+        except NoEndpoints as e:
             if "_" not in name:
                 raise e
             endpoint_type = name.split("_")[1]
@@ -112,7 +124,8 @@ class SNFProvisioner(object):
             self.config.update(yaml.load(fd))
 
         self.clouds = self.config.get('clouds', [None])
-        self.clouds_id = ",".join(map(lambda x: x or 'None', sorted(self.clouds)))
+        self.clouds_id = ",".join(map(lambda x: x or 'None',
+                                      sorted(self.clouds)))
         self.clients = {}
         self.logger = logging.getLogger('snf_provision')
         self.logger.addHandler(logging.StreamHandler(sys.stdout))
@@ -155,6 +168,8 @@ class SNFProvisioner(object):
             return None
 
         images = client.compute.list_images(detail=True)
+        images = reversed(sorted(images, key=lambda x: x['updated']))
+
         _name_re = None
         if image_name:
             _name_re = re.compile(".*%s.*" % image_name)
@@ -165,26 +180,24 @@ class SNFProvisioner(object):
         image_id = None
         _found = False
         for image in images:
-            if _found:
-                break
-
             _name_found = False
             _name = image['name'] + ' ' + \
                 image.get('metadata', {}).get('description', '')
 
             if _name_re and _name_re.match(_name):
-                print "NAME FOUND", _name
                 _name_found = True
 
             if not _user_re:
                 if _name_found:
                     _found = image
+                    break
                 continue
 
             _user_id = image['user_id']
             _username = client.auth_client.get_username(_user_id)
             if _user_re and _user_re.match(_username) and _name_found:
                 _found = image
+                break
 
         if _found:
             self.logger.info("Resolved image to %s (%s)" %
@@ -226,6 +239,9 @@ class SNFProvisioner(object):
         fscache.purge()
         conf = self.config.get('provision', {})
 
+        if not conf:
+            raise Exception("Config seems to be empty")
+
         for network, meta in conf.get('networks').iteritems():
             client = self.get_client(meta.get('cloud'))
             networks = self.networks()
@@ -237,8 +253,8 @@ class SNFProvisioner(object):
             _net = {'id': 'None'}
             if not dryrun:
                 _net = client.network.create_network(name=network,
-                                                    type=meta.get('type'),
-                                                    project_id=project_id)
+                                                     type=meta.get('type'),
+                                                     project_id=project_id)
             self.logger.info("Network %r created with id %r" %
                              (network, _net['id']))
 
@@ -271,7 +287,7 @@ class SNFProvisioner(object):
             project = self.get_project(meta, client)
 
             metadata = {}
-            metadata['groups'] = ",".join(meta.get('groups', []))
+            metadata['groups'] = ",".join(flatten(meta.get('groups', [])))
             metadata['snf_machine_name'] = machine
             metadata['ansible_vars'] = json.dumps(meta.get('vars', {}))
 
@@ -292,12 +308,16 @@ class SNFProvisioner(object):
                     self.logger.info("\tUpdating server metadata")
                     if not dryrun:
                         client.compute.update_server_metadata(_machine_id,
-                                                            **remote_meta)
+                                                              **remote_meta)
                 continue
 
             ports = []
             networks = []
-            for network, _meta in meta.get('networks', {}).iteritems():
+            connect_to = meta.get('networks', {})
+            if isinstance(connect_to, list):
+                connect_to = flatten(connect_to)
+                connect_to = dict(zip(connect_to, [{} for x in connect_to]))
+            for network, _meta in connect_to.iteritems():
                 netid = None
                 for _net in allnets.values():
                     if network == _net['name']:
@@ -319,7 +339,7 @@ class SNFProvisioner(object):
                         ports.append({'uuid': netid, 'port': port['id']})
                     self.logger.info("Created port %r connected to %r" %
                                      (port['id'], network))
-                except Exception, e:
+                except Exception as e:
                     # cleanup ports
                     for port in client.network.list_ports():
                         if port['status'] == 'DOWN':
@@ -343,7 +363,7 @@ class SNFProvisioner(object):
                             created_ips.append(ip['id'])
                         self.logger.info("Created floating ip %r" %
                                          ip['floating_ip_address'])
-                    except Exception, e:
+                    except Exception as e:
                         create_server = False
                         self.logger.exception(e)
                 else:
@@ -371,13 +391,27 @@ class SNFProvisioner(object):
             personality = []
             files = meta.get('files', [])
 
+            jinja = Environment()
             for attch in files:
                 contents = attch.get('contents', '')
+                render = attch.get('render', False)
                 if os.path.exists(contents):
                     with file(contents) as f:
                         contents = f.read()
+                if render:
+                    context = dict()
+                    context['machines'] = machines
+                    context.update(meta.get('vars'))
+                    context['host'] = metadata
+                    try:
+                        contents = \
+                            jinja.from_string(contents).render(**context)
+                    except Exception, e:
+                        self.logger.error("Template error %r: %s" % (attch, e))
+                        create_server = False
                 contents = base64.b64encode(contents)
                 entry = dict(attch)
+                del entry['render']
                 entry['contents'] = contents
                 personality.append(entry)
 
@@ -409,7 +443,7 @@ class SNFProvisioner(object):
                         time.sleep(sleep)
                     self.logger.info("Machine %s created %r" % (name,
                                                                 server['id']))
-                except Exception, e:
+                except Exception as e:
                     create_server = False
                     self.logger.exception(e)
 
