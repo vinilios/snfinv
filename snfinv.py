@@ -29,7 +29,7 @@ except ImportError:
 
 from kamaki.clients.utils import https
 from kamaki.clients.astakos import AstakosClient, parse_endpoints
-from kamaki.cli import _setup_logging
+from kamaki.cli import _setup_logging, ClientError
 
 from astakosclient.errors import NoEndpoints
 
@@ -47,11 +47,15 @@ def flatten(z):
 class CloudClient(object):
 
     clients_map_override = {
-        'cyclades': {'endpoint': 'compute'}
+        'cyclades': {'endpoint': 'compute'},
+        'volume': {
+            'module': 'kamaki.clients.cyclades.CycladesBlockStorageClient',
+            'endpoint': 'volume'
+        }
     }
 
     clients_override = {
-        'network': 'cyclades_network'
+        'network': 'cyclades_network',
     }
 
     def __init__(self, config, cloud=None, debug=False):
@@ -274,7 +278,7 @@ class SNFProvisioner(object):
         allnets = self.networks()
         ips = None
 
-        _conf_machines = conf.get('machines', {})
+        _conf_machines = conf.get('machines') or {}
         keys = sorted(_conf_machines.keys())
 
         for key in keys:
@@ -283,6 +287,7 @@ class SNFProvisioner(object):
             meta = _conf_machines.get(key)
 
             create_server = True
+            update_server = False
             client = self.get_client(meta.get('cloud'))
             project = self.get_project(meta, client)
 
@@ -291,11 +296,16 @@ class SNFProvisioner(object):
             metadata['snf_machine_name'] = machine
             metadata['ansible_vars'] = json.dumps(meta.get('vars', {}))
 
+            machine_id = None
+            machine_details = {}
             if machine in machines:
                 self.logger.info("Machine %r already exists" % machine)
-                _machine_id = machines[machine]['vars']['snf_machine_id']
-                remote_meta = client.compute.get_server_metadata(_machine_id)
+                machine_id = machines[machine]['vars']['snf_machine_id']
+                machine_details = client.compute.get_server_details(machine_id)
+                remote_meta = client.compute.get_server_metadata(machine_id)
                 changed = []
+                create_server = False
+                update_server = True
                 for key, val in metadata.iteritems():
                     if key in remote_meta:
                         if remote_meta[key] != metadata[key]:
@@ -305,18 +315,22 @@ class SNFProvisioner(object):
                         changed.append(key)
                         remote_meta[key] = metadata[key]
                 if changed:
-                    self.logger.info("\tUpdating server metadata")
+                    self.logger.info("\tUpdating server metadata %r", changed)
                     if not dryrun:
-                        client.compute.update_server_metadata(_machine_id,
+                        client.compute.update_server_metadata(machine_id,
                                                               **remote_meta)
-                continue
-
-            ports = []
+            created_ports = []
             networks = []
             connect_to = meta.get('networks', {})
             if isinstance(connect_to, list):
                 connect_to = flatten(connect_to)
                 connect_to = dict(zip(connect_to, [{} for x in connect_to]))
+
+            is_floating = lambda ip: ip.get('OS-EXT-IPS:type', None) == 'floating'
+            first_ip = lambda ip: ip[0]
+            existing_ips = map(first_ip, machine_details.get('addresses', {}).values())
+            floating = filter(is_floating, existing_ips)
+
             for network, _meta in connect_to.iteritems():
                 netid = None
                 for _net in allnets.values():
@@ -329,14 +343,22 @@ class SNFProvisioner(object):
                     # ip as value
                     ips = [{'ip_address': _meta}]
                 try:
-                    if netid is None:
+                    if netid is None and not dryrun:
                         raise Exception("%r network does not exist" % network)
                     port = {'id': 'None'}
                     if not dryrun:
-                        port = client.network.create_port(
-                            network_id=netid,
-                            fixed_ips=ips)
-                        ports.append({'uuid': netid, 'port': port['id']})
+                        params = {
+                            'network_id': netid,
+                            'fixed_ips': ips
+                        }
+                        if update_server:
+                            params['device_id'] = machine_id
+                        try:
+                            port = client.network.create_port(**params)
+                        except ClientError, e:
+                            if 'CONFLICT' in e.message and not machine_id:
+                                raise e
+                        created_ports.append({'uuid': netid, 'port': port['id']})
                     self.logger.info("Created port %r connected to %r" %
                                      (port['id'], network))
                 except Exception as e:
@@ -349,8 +371,12 @@ class SNFProvisioner(object):
 
             ips = []
             created_ips = []
-            for ip in meta.get('floating_ips', []):
+
+            for i, ip in enumerate(meta.get('floating_ips', [])):
                 if ip == 'auto':
+                    if len(floating) > i:
+                        self.logger.info("Skipping 'auto' floating ip")
+                        continue
                     # TODO: find spare
                     # if no spare available, create one
                     create = client.network.create_floatingip
@@ -377,16 +403,16 @@ class SNFProvisioner(object):
                                 'fixed_ip': _ip['floating_ip_address']
                             })
                     if not found:
-                        self.logger.error("%s floating ip not found" % ip)
+                        self.logger.error("Floating ip %r not found" % ip)
                         create_server = False
 
-            name = machine
+            machine_name = machine
             image_id = self.get_image(meta.get('image', None), client)
             keys = map(lambda k: file(k).read(), meta.get('keys', []))
             flavor = self.get_flavor(meta.get('flavor', {}), client)
             networks = []
             networks += ips
-            networks += ports
+            networks += created_ports
 
             personality = []
             files = meta.get('files', [])
@@ -432,7 +458,7 @@ class SNFProvisioner(object):
                     server = {'id': 'None'}
                     if not dryrun:
                         server = client.cyclades.create_server(
-                            name=name,
+                            name=machine_name,
                             image_id=image_id,
                             project_id=project,
                             personality=personality,
@@ -441,19 +467,77 @@ class SNFProvisioner(object):
                             flavor_id=flavor
                         )
                         time.sleep(sleep)
-                    self.logger.info("Machine %s created %r" % (name,
+                        machine_id = server.get('id')
+                    self.logger.info("Machine %s created %r" % (machine_name,
                                                                 server['id']))
                 except Exception as e:
                     create_server = False
                     self.logger.exception(e)
 
-            if not create_server:
+            machine_project = meta.get('project')
+            if machine_id:
+                self.provision_disks(client, meta.get('disks', []), machine_id,
+                                     machine_name, machine_project, machine_details, meta,
+                                     dryrun)
+
+            if not create_server and not update_server:
                 for ip in created_ips:
                     self.logger.info("Deleting redundant IP")
                     client.network.delete_floatingip(ip)
-                for port in ports:
+                for port in created_ports:
                     self.logger.info("Deleting redundant ports")
                     client.network.delete_port(port['port'])
+
+    def provision_disks(self, client, disks, machine_id, machine_name,
+                        machine_project, machine_details, meta, dryrun):
+        self.logger.info("Provisioning disks")
+        _disks = client.cyclades.list_volume_attachments(machine_id)
+        _disks = map(client.volume.get_volume_details, map(lambda d: d.get('volumeId'), _disks))
+        _disks = dict(map(lambda d:(d.get('display_name'), d), _disks))
+
+        types = client.volume.list_volume_types()
+        types_by_name = dict(map(lambda t: (t.get('name'), t.get('id')), types))
+        types_by_id = dict(map(lambda t: (str(t.get('id')), t), types))
+
+        for i, disk in enumerate(disks):
+            if isinstance(disk, int):
+                disk = {'size': disk}
+            disk_name = disk.get('name', '{}-disk-{}'.format(machine_name, i))
+            size = disk.get('size')
+            disk['type'] = disk.get('type') or u'drbd'
+            create = client.volume.create_volume
+            if disk_name in _disks:
+                self.logger.error("Disk %r already attached to %r", disk_name,
+                                  machine_name)
+                continue
+            params = {
+                'volume_type': types_by_name.get(disk['type']) or
+                    int(disk['type']),
+                'display_name': disk.get('name'),
+                'size': disk.get('size'),
+                'project': disk.get('project') or machine_project
+            }
+            is_detachable = True
+            if types_by_id[str(params.get('volume_type'))].get('name') \
+                    in ['drbd']:
+                is_detachable = False
+            if machine_id:
+                params['server_id'] = machine_id
+
+            id = None
+            if meta.get('id') or not is_detachable:
+                if machine_details.get('status', None) == 'ACTIVE':
+                    self.logger.info("Creating disk %s to server %s", disk_name,
+                                    machine_name)
+                    if not dryrun:
+                        created = create(**params)
+                        id = created.get('id')
+                        client.volume.wait_volume_until(id)
+                    self.logger.info("Created disk %s[%s] attached to server %s",
+                                    disk_name, id, machine_name)
+                else:
+                    self.logger.info('Skip disk provision for %s[%s]', machine_name, machine_details.get('status'))
+
 
     def networks(self):
         networks = {}
@@ -461,6 +545,13 @@ class SNFProvisioner(object):
             for network in client.network.list_networks():
                 networks[network['name'] + network['id']] = network
         return networks
+
+    def disks(self):
+        disks = {}
+        for client in self.clients.values():
+            for disk in client.volume.list_volumes():
+                disks[disk.get('display_name') or disk.get('id')] = disk
+        return disks
 
     def machines(self, hosts_only=False, prefix=None):
 
